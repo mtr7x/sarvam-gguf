@@ -1,111 +1,97 @@
-# Sarvam-30B → GGUF: Status and Findings
+# Sarvam-30B → GGUF
 
-Investigating what it takes to convert [sarvamai/sarvam-30b](https://huggingface.co/sarvamai/sarvam-30b) to GGUF for local inference via Ollama, LM Studio, and llama.cpp.
+Convert [sarvamai/sarvam-30b](https://huggingface.co/sarvamai/sarvam-30b) to GGUF by patching llama.cpp with [PR #20275](https://github.com/ggml-org/llama.cpp/pull/20275).
 
-Read: [Sarvam. Open is not sovereign](https://mtrajan.substack.com/p/sarvam-open-is-not-sovereign)
+## What this does
 
-## TL;DR
+1. Clones llama.cpp
+2. Applies PR #20275 — adds `sarvam_moe` architecture (converter + C++ runtime + tokenizer)
+3. Builds `llama-quantize` and `llama-cli`
+4. Downloads Sarvam-30B from HuggingFace (~60GB)
+5. Converts to GGUF F16
+6. Quantizes to Q4_K_M and Q8_0
+7. Tests inference with a Hindi prompt
 
-**Conversion fails immediately.** You don't need to download 60GB to find out — the blocker is a missing ~50-line class registration in llama.cpp, not the sigmoid routing.
+## Run on Colab (one click)
 
-## What we found
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mtr7x/sarvam-gguf/blob/main/sarvam_gguf_attempt.ipynb)
 
-We downloaded Sarvam-30B's `config.json` and checked it against the latest llama.cpp source:
+Runtime → GPU → Run All. Model saves to Google Drive (survives disconnects).
 
-```
-model_type:    "sarvam_moe"           → ❌ No converter class in llama.cpp
-architecture:  "SarvamMoEForCausalLM" → ❌ Not registered
-```
+## Run locally / on a server
 
-| Feature | llama.cpp Status |
-|---|---|
-| Sigmoid routing (`score_function: "sigmoid"`) | ✅ Already supported (auto-detected) |
-| MoE expert merging | ✅ Supported (via Qwen2MoeModel) |
-| Shared experts | ✅ Supported |
-| `moe_intermediate_size` | ✅ Supported |
-| **`model_type: "sarvam_moe"`** | ❌ **No class registered** |
-
-The sigmoid routing — which the original article identified as the deployment blocker — is actually **already handled** by llama.cpp. The real blocker is that nobody has registered `SarvamMoEForCausalLM` as a model class in `convert_hf_to_gguf.py` and added the architecture enum + tensor mappings to `gguf-py`.
-
-The fix is structurally simple. Sarvam's architecture is very close to `Qwen2MoeModel`:
-
-```python
-@ModelBase.register("SarvamMoEForCausalLM")
-class SarvamMoeModel(Qwen2MoeModel):
-    model_arch = gguf.MODEL_ARCH.SARVAM_MOE
+```bash
+git clone https://github.com/mtr7x/sarvam-gguf.git
+cd sarvam-gguf
+chmod +x patch_and_convert.sh
+./patch_and_convert.sh
 ```
 
-Plus arch enum and tensor name mappings. That's what [llama.cpp PR #20275](https://github.com/ggml-org/llama.cpp/pull/20275) does.
+Needs ~120GB disk, cmake, Python 3.10+.
 
-## The domino chain to `ollama run sarvam-30b`
+## Why this is needed
+
+Sarvam open-sourced 30B and 105B under Apache 2.0, but no GGUF exists. Mainline llama.cpp doesn't recognize `model_type: "sarvam_moe"` — the converter exits immediately.
+
+Contrary to what you might expect, **sigmoid routing is already supported** in llama.cpp (used by GLM4 and others). The actual blocker is a missing class registration + tensor mappings + C++ graph builder — all provided by PR #20275.
+
+Read the full analysis: [Sarvam. Open is not sovereign](https://mtrajan.substack.com/p/sarvam-open-is-not-sovereign)
+
+## What PR #20275 adds (387 lines)
+
+| File | What |
+|------|------|
+| `convert_hf_to_gguf.py` | `SarvamMoEModel` class — tokenizer conversion (SentencePiece → GPT-2), expert merging, expert bias normalization |
+| `gguf-py/gguf/constants.py` | `SARVAM_MOE` arch enum + tensor list (20 tensor types) |
+| `src/models/sarvam-moe.cpp` | C++ graph builder — attention with QK norm, RoPE, dense FFN for layer 0, MoE + shared experts for layers 1-18 |
+| `src/llama-arch.cpp` | Architecture name + tensor registration |
+| `src/llama-model.cpp` | Hyperparameter loading + tensor creation + model info |
+| `src/llama-vocab.cpp` | Sarvam-specific tokenizer regex |
+
+## The domino chain
 
 ```
-llama.cpp PR #20275 merges (converter + C++ runtime)
-  → llama.cpp can convert + run sarvam_moe
-    → Ollama updates its bundled llama.cpp
-      → Unsloth applies dynamic quantization (protects Indic embedding layers)
-        → GGUF on HuggingFace
-          → ollama run sarvam-30b
+PR #20275 merges into llama.cpp          ← we apply this manually
+  → GGUF can be created                  ← this repo does it
+    → Ollama updates its llama.cpp
+      → Unsloth applies dynamic quants   (protects Indic embedding layers)
+        → ollama run sarvam-30b
 ```
-
-Every step after the first is routine. Unsloth has done it for DeepSeek R1, Llama 4, Qwen 3, and Gemma 3 — usually within days of release. The bottleneck is the single llama.cpp PR.
-
-## How Unsloth creates GGUFs (and why they can't do it for Sarvam yet)
-
-Unsloth maintains a [fork of llama.cpp](https://github.com/unslothai/llama.cpp) and has a one-liner API:
-
-```python
-model.save_pretrained_gguf("dir", tokenizer, quantization_method="q4_k_m")
-```
-
-For pre-trained models (like DeepSeek R1), they:
-1. Run `convert_hf_to_gguf.py` from their fork
-2. Apply **dynamic quantization** — profiling each layer's sensitivity, keeping critical layers (embeddings, early dense layers, `down_proj`) at higher precision while compressing MoE experts to 1.5-2 bits
-3. Fix bugs (chat templates, tokenizer, padding tokens)
-4. Upload GGUFs to HuggingFace
-
-**For DeepSeek R1**, the architecture was already in mainline llama.cpp. Unsloth's contribution was the quantization strategy. For Sarvam, the architecture itself is missing — so even Unsloth can't start.
-
-The Indic quantization problem from the article is real but comes *after* the architecture registration. Once a GGUF can be created, Unsloth's dynamic quantization approach (selectively preserving embedding and vocabulary layers at higher precision) is exactly what Sarvam needs to protect its Indic language advantage during compression.
 
 ## Runtime support (March 2026)
 
-| Runtime | Status | Notes |
-|---------|--------|-------|
-| vLLM | ✅ Merged | [PR #33942](https://github.com/vllm-project/vllm/pull/33942), Mar 10 |
-| SGLang | ✅ Works | Sigmoid routing supported |
-| llama.cpp | ⏳ Pending | [PR #20275](https://github.com/ggml-org/llama.cpp/pull/20275) — the single bottleneck |
-| Ollama | ❌ Blocked | Needs llama.cpp merge |
-| LM Studio | ❌ Blocked | Needs llama.cpp merge |
-| GGUF | ❌ None exists | Blocked on llama.cpp |
+| Runtime | Status |
+|---------|--------|
+| vLLM | ✅ [PR #33942](https://github.com/vllm-project/vllm/pull/33942) merged |
+| SGLang | ✅ Works |
+| llama.cpp | ⏳ [PR #20275](https://github.com/ggml-org/llama.cpp/pull/20275) pending — **this repo applies it** |
+| Ollama | ❌ Blocked on llama.cpp |
+| GGUF | ❌ → ⏳ **This repo creates it** |
 
-## Architecture reference
+## Architecture
 
 ```
-sarvamai/sarvam-30b (config.json)
+sarvamai/sarvam-30b
 ├── model_type: "sarvam_moe"
-├── architecture: "SarvamMoEForCausalLM"
-├── 30B total params, 2.4B active
+├── 30B params, 2.4B active
 ├── 19 layers (1 dense + 18 MoE)
-├── 128 routed experts + 1 shared, top-6
-├── score_function: "sigmoid"
-├── hidden_size: 4096, head_dim: 64
-├── 64 query heads, 4 KV heads
-├── vocab_size: 262144 (large — Indic tokenizer)
-├── routed_scaling_factor: 2.5
+├── 128 experts + 1 shared, top-6, sigmoid routing
+├── 64 query heads, 4 KV heads, head_dim=64
+├── vocab_size: 262,144 (Indic-optimized)
 └── Apache 2.0
 ```
 
 ## Files
 
-- `sarvam_gguf_attempt.ipynb` — Colab notebook that attempts the full conversion pipeline (requires Google Drive for storage)
-- `convert_sarvam_gguf.py` — Standalone script version
+| File | What |
+|------|------|
+| `patch_and_convert.sh` | Full pipeline: clone, patch, build, download, convert, quantize |
+| `sarvam_gguf_attempt.ipynb` | Same pipeline as a Colab notebook with Google Drive storage |
+| `convert_sarvam_gguf.py` | Standalone Python script |
 
 ## Related
 
-- [Sarvam. Open is not sovereign](https://mtrajan.substack.com/p/sarvam-open-is-not-sovereign) — the original analysis
-- [Sarvam blog: Open-sourcing 30B and 105B](https://www.sarvam.ai/blogs/sarvam-30b-105b)
-- [vLLM PR #33942: Sarvam MoE support](https://github.com/vllm-project/vllm/pull/33942) (merged)
-- [llama.cpp PR #20275: sarvam_moe architecture](https://github.com/ggml-org/llama.cpp/pull/20275) (pending)
-- [Unsloth Dynamic Quantization](https://unsloth.ai/blog/dynamic-4bit) — the approach Sarvam needs for Indic-safe quantization
-- [Unsloth DeepSeek R1 1.58-bit](https://unsloth.ai/blog/deepseekr1-dynamic) — proof that MoE dynamic quantization works
+- [Sarvam. Open is not sovereign](https://mtrajan.substack.com/p/sarvam-open-is-not-sovereign)
+- [llama.cpp PR #20275](https://github.com/ggml-org/llama.cpp/pull/20275) — the patch we apply
+- [vLLM PR #33942](https://github.com/vllm-project/vllm/pull/33942) — merged
+- [Unsloth Dynamic Quantization](https://unsloth.ai/blog/dynamic-4bit) — what Sarvam needs for Indic-safe compression
