@@ -2,6 +2,16 @@
 
 Convert [sarvamai/sarvam-30b](https://huggingface.co/sarvamai/sarvam-30b) to GGUF by patching llama.cpp with [PR #20275](https://github.com/ggml-org/llama.cpp/pull/20275).
 
+**Pre-built GGUFs available:** [mtrajan/sarvam-30b-GGUF on HuggingFace](https://huggingface.co/mtrajan/sarvam-30b-GGUF)
+
+> **Will this work with Ollama / LM Studio / Jan?**
+>
+> **Not yet.** These tools bundle mainline llama.cpp, which does not recognize `sarvam_moe`. You will see:
+> ```
+> error loading model: unknown model architecture: 'sarvam_moe'
+> ```
+> This GGUF **requires a patched llama.cpp** (with PR #20275 applied) until that PR merges into mainline. Once it does, Ollama / LM Studio / Jan will work automatically on their next update.
+
 ## What this does
 
 1. Clones llama.cpp
@@ -11,6 +21,15 @@ Convert [sarvamai/sarvam-30b](https://huggingface.co/sarvamai/sarvam-30b) to GGU
 5. Converts to GGUF F16
 6. Quantizes to Q4_K_M and Q8_0
 7. Tests inference with a Hindi prompt
+
+## Pre-built GGUFs
+
+If you just want the files, download from HuggingFace:
+
+| File | Quant | Size | BPW |
+|------|-------|------|-----|
+| [sarvam-30b-q4_k_m.gguf](https://huggingface.co/mtrajan/sarvam-30b-GGUF) | Q4_K_M | 19 GB | 4.87 |
+| [sarvam-30b-f16.gguf](https://huggingface.co/mtrajan/sarvam-30b-GGUF) | F16 | 60 GB | 16.00 |
 
 ## Run on Colab (one click)
 
@@ -37,6 +56,16 @@ Contrary to what you might expect, **sigmoid routing is already supported** in l
 
 Read the full analysis: [Sarvam. Open is not sovereign](https://mtrajan.substack.com/p/sarvam-open-is-not-sovereign)
 
+## What does NOT work (yet)
+
+| Tool | Status | Why |
+|------|--------|-----|
+| Ollama | `unknown model architecture` | Waiting on PR #20275 merge |
+| LM Studio | `unknown model architecture` | Waiting on PR #20275 merge |
+| Jan | `unknown model architecture` | Waiting on PR #20275 merge |
+| llama.cpp (mainline) | `unknown model architecture` | PR #20275 not yet merged |
+| llama.cpp (patched) | **Works** | This repo builds it |
+
 ## What PR #20275 adds (387 lines)
 
 | File | What |
@@ -53,9 +82,9 @@ Read the full analysis: [Sarvam. Open is not sovereign](https://mtrajan.substack
 ```
 PR #20275 merges into llama.cpp          ← we apply this manually
   → GGUF can be created                  ← this repo does it
-    → Ollama updates its llama.cpp
-      → Unsloth applies dynamic quants   (protects Indic embedding layers)
-        → ollama run sarvam-30b
+    → Ollama updates its llama.cpp       ← blocked
+      → Unsloth applies dynamic quants   ← blocked
+        → ollama run sarvam-30b          ← blocked
 ```
 
 ## Runtime support (March 2026)
@@ -64,9 +93,11 @@ PR #20275 merges into llama.cpp          ← we apply this manually
 |---------|--------|
 | vLLM | ✅ [PR #33942](https://github.com/vllm-project/vllm/pull/33942) merged |
 | SGLang | ✅ Works |
-| llama.cpp | ⏳ [PR #20275](https://github.com/ggml-org/llama.cpp/pull/20275) pending — **this repo applies it** |
+| llama.cpp (patched) | ✅ Works — **this repo builds it** |
+| llama.cpp (mainline) | ⏳ [PR #20275](https://github.com/ggml-org/llama.cpp/pull/20275) pending |
 | Ollama | ❌ Blocked on llama.cpp |
-| GGUF | ❌ → ⏳ **This repo creates it** |
+| LM Studio | ❌ Blocked on llama.cpp |
+| GGUF | ✅ [mtrajan/sarvam-30b-GGUF](https://huggingface.co/mtrajan/sarvam-30b-GGUF) |
 
 ## Architecture
 
@@ -92,6 +123,7 @@ sarvamai/sarvam-30b
 ## Related
 
 - [Sarvam. Open is not sovereign](https://mtrajan.substack.com/p/sarvam-open-is-not-sovereign)
+- [mtrajan/sarvam-30b-GGUF](https://huggingface.co/mtrajan/sarvam-30b-GGUF) — pre-built GGUFs on HuggingFace
 - [llama.cpp PR #20275](https://github.com/ggml-org/llama.cpp/pull/20275) — the patch we apply
 - [vLLM PR #33942](https://github.com/vllm-project/vllm/pull/33942) — merged
 - [Unsloth Dynamic Quantization](https://unsloth.ai/blog/dynamic-4bit) — what Sarvam needs for Indic-safe compression
